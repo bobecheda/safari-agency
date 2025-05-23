@@ -1,108 +1,110 @@
-from rest_framework import viewsets, permissions, status
+from rest_framework import viewsets, status, generics
+from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.decorators import action
-from django.shortcuts import get_object_or_404
-from .models import User, Sacco, Driver, Matatu, Route, Booking
+from rest_framework.permissions import IsAuthenticated
+from django.contrib.auth import get_user_model
+from .models import Booking, Driver, Matatu, Sacco, JourneyQueue, CustomerProfile
 from .serializers import (
-    UserSerializer, SaccoSerializer, DriverSerializer,
-    MatatuSerializer, RouteSerializer, BookingSerializer
+    BookingSerializer, DriverSerializer, MatatuSerializer,
+    CustomerProfileSerializer, CustomUserSerializer
 )
+from .permissions import IsCustomer, IsSaccoAdmin, IsOwnerOrReadOnly
 
-class UserViewSet(viewsets.ModelViewSet):
+User = get_user_model()
+
+class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
-    serializer_class = UserSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        if self.request.user.is_staff:
-            return User.objects.all()
-        return User.objects.filter(id=self.request.user.id)
-
-class SaccoViewSet(viewsets.ModelViewSet):
-    queryset = Sacco.objects.all()
-    serializer_class = SaccoSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        if self.request.user.is_staff or self.request.user.is_sacco_admin:
-            return Sacco.objects.all()
-        return Sacco.objects.filter(contact_person=self.request.user)
-
-class DriverViewSet(viewsets.ModelViewSet):
-    queryset = Driver.objects.all()
-    serializer_class = DriverSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        if self.request.user.is_staff:
-            return Driver.objects.all()
-        if self.request.user.is_sacco_admin:
-            return Driver.objects.filter(sacco__contact_person=self.request.user)
-        return Driver.objects.filter(user=self.request.user)
-
-class MatatuViewSet(viewsets.ModelViewSet):
-    queryset = Matatu.objects.all()
-    serializer_class = MatatuSerializer
-    permission_classes = [permissions.IsAuthenticated]
-
-    def get_queryset(self):
-        if self.request.user.is_staff:
-            return Matatu.objects.all()
-        if self.request.user.is_sacco_admin:
-            return Matatu.objects.filter(sacco__contact_person=self.request.user)
-        if self.request.user.is_driver:
-            return Matatu.objects.filter(driver__user=self.request.user)
-        return Matatu.objects.filter(status='AVAILABLE')
-
-    @action(detail=True, methods=['post'])
-    def assign_driver(self, request, pk=None):
-        matatu = self.get_object()
-        driver_id = request.data.get('driver_id')
-        
-        if not driver_id:
-            return Response({'error': 'Driver ID is required'}, status=status.HTTP_400_BAD_REQUEST)
-            
-        driver = get_object_or_404(Driver, id=driver_id)
-        
-        if driver.status != 'ACTIVE':
-            return Response({'error': 'Driver is not active'}, status=status.HTTP_400_BAD_REQUEST)
-            
-        matatu.driver = driver
-        matatu.save()
-        
-        return Response(MatatuSerializer(matatu).data)
-
-class RouteViewSet(viewsets.ModelViewSet):
-    queryset = Route.objects.all()
-    serializer_class = RouteSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = CustomUserSerializer
+    permission_classes = []
 
 class BookingViewSet(viewsets.ModelViewSet):
     queryset = Booking.objects.all()
     serializer_class = BookingSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsCustomer]
 
     def get_queryset(self):
         if self.request.user.is_staff:
             return Booking.objects.all()
-        if self.request.user.is_sacco_admin:
-            return Booking.objects.filter(matatu__sacco__contact_person=self.request.user)
-        if self.request.user.is_driver:
-            return Booking.objects.filter(matatu__driver__user=self.request.user)
-        return Booking.objects.filter(passenger=self.request.user)
+        return Booking.objects.filter(customer=self.request.user)
 
-    def perform_create(self, serializer):
-        serializer.save(passenger=self.request.user)
+class DriverViewSet(viewsets.ModelViewSet):
+    queryset = Driver.objects.all()
+    serializer_class = DriverSerializer
+    permission_classes = [IsAuthenticated, IsSaccoAdmin]
 
-    @action(detail=True, methods=['post'])
-    def update_status(self, request, pk=None):
-        booking = self.get_object()
-        status = request.data.get('status')
-        
-        if not status or status not in ['CONFIRMED', 'COMPLETED', 'CANCELLED']:
-            return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
-            
-        booking.status = status
-        booking.save()
-        
-        return Response(BookingSerializer(booking).data)
+    def get_queryset(self):
+        if self.request.user.is_staff:
+            return Driver.objects.all()
+        return Driver.objects.filter(sacco=self.request.user.adminprofile.sacco)
+
+class MatatuViewSet(viewsets.ModelViewSet):
+    queryset = Matatu.objects.all()
+    serializer_class = MatatuSerializer
+    permission_classes = [IsAuthenticated, IsSaccoAdmin]
+
+    def get_queryset(self):
+        if self.request.user.is_staff:
+            return Matatu.objects.all()
+        return Matatu.objects.filter(sacco=self.request.user.adminprofile.sacco)
+
+class CustomerViewSet(viewsets.ModelViewSet):
+    queryset = CustomerProfile.objects.all()
+    serializer_class = CustomerProfileSerializer
+    permission_classes = [IsAuthenticated, IsOwnerOrReadOnly]
+
+    def get_queryset(self):
+        if self.request.user.is_staff:
+            return CustomerProfile.objects.all()
+        return CustomerProfile.objects.filter(user=self.request.user)
+
+class AvailableMatatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        available_matatus = Matatu.objects.filter(
+            is_available=True,
+            is_insured=True
+        ).select_related('sacco', 'route', 'current_stage')
+        serializer = MatatuSerializer(available_matatus, many=True)
+        return Response(serializer.data)
+
+class QueueStatusView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queues = JourneyQueue.objects.all().select_related(
+            'matatu',
+            'matatu__sacco'
+        ).order_by('queue_position')
+        data = [{
+            'matatu': matatu.matatu.number_plate,
+            'sacco': matatu.matatu.sacco.name,
+            'position': matatu.queue_position,
+            'status': matatu.status,
+            'departure': matatu.departure_time,
+            'direction': matatu.direction
+        } for matatu in queues]
+        return Response(data)
+
+class SaccoDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, sacco_id):
+        try:
+            sacco = Sacco.objects.get(id=sacco_id)
+            data = {
+                'name': sacco.name,
+                'description': sacco.description,
+                'services': sacco.services_offered,
+                'contact': sacco.contact,
+                'route': sacco.route.route_name if sacco.route else None,
+                'available_matatus': sacco.matatu_set.filter(
+                    is_available=True
+                ).count()
+            }
+            return Response(data)
+        except Sacco.DoesNotExist:
+            return Response(
+                {'error': 'Sacco not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
